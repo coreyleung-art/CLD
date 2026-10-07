@@ -1,0 +1,644 @@
+/**
+ * CLD — desktop GUI shell for DeepSeek Harness (dsh).
+ *
+ * Architecture
+ * ------------
+ * CLD is a thin Electron shell around the dsh web profile:
+ *
+ *   1. It spawns `dsh web --port 0` as a child process using its OWN binary
+ *      with ELECTRON_RUN_AS_NODE=1 — i.e. Electron's bundled Node runs the
+ *      dsh CLI, so the app needs no external Node installation. The dsh
+ *      runtime tree lives unpacked in resources/dsh-runtime (dev: ./runtime).
+ *
+ *   2. `--port 0` lets the OS assign a free port (never conflicts with a
+ *      browser instance already serving dsh on 3080). The real URL is parsed
+ *      from the child's `dsh web: http://127.0.0.1:<port>` stdout line.
+ *
+ *   3. A BrowserWindow loads that local URL. The dsh server injects
+ *      window.__DSH_BOOT__ itself, so CLD never touches the frontend build.
+ *
+ *   4. On quit the child is terminated (SIGTERM → SIGKILL grace).
+ */
+"use strict";
+
+const { app, BrowserWindow, Menu, dialog, shell, Notification } = require("electron");
+const { spawn } = require("node:child_process");
+const { createWriteStream, existsSync, mkdirSync, statSync, truncateSync, writeFileSync } = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+const APP_NAME = "CLD";
+const BOOT_TIMEOUT_MS = 120_000; // generous: plugin tree boot + frontend mount
+const KILL_GRACE_MS = 3_000;
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+/** ------------------------------------------------------------------ paths */
+
+function runtimeDir() {
+  // Packaged: extraResources from: . → to: dsh-runtime copies the runtime/
+  // subtree under resources/dsh-runtime/runtime (see electron-builder.yml).
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "dsh-runtime", "runtime")
+    : path.join(__dirname, "runtime");
+}
+
+function dshBinPath(runtime) {
+  return path.join(runtime, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+}
+
+function iconPath() {
+  // Packaged apps carry the icon inside the bundle; dev uses the build asset.
+  return app.isPackaged ? undefined : path.join(__dirname, "build", "icon.png");
+}
+
+/** ----------------------------------------------------------------- logging */
+
+function openLogStream() {
+  const dir = path.join(os.homedir(), ".cld", "logs");
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "dsh-web.log");
+  try {
+    if (existsSync(file) && statSync(file).size > LOG_MAX_BYTES) truncateSync(file, 0);
+  } catch {
+    /* non-fatal */
+  }
+  return createWriteStream(file, { flags: "a" });
+}
+
+/** ----------------------------------------------------------- child process */
+
+/**
+ * Cross-device configuration (all optional env vars):
+ *   CLD_REMOTE_URL=<url>      connect-only mode: do NOT start a local server;
+ *                             load this remote dsh web URL instead.
+ *   CLD_BIND_HOST=<ip>        server mode: bind dsh web to this host (e.g.
+ *                             0.0.0.0) so other devices can reach it.
+ *   CLD_PORT=<port>           stable port for server mode (default 3081).
+ *   CLD_TRUSTED_HOSTS=<h1,h2> extra authorities for dsh's /api trust fence
+ *                             (host or host:port, comma-separated).
+ *   CLD_HEADLESS=1           server role without a window (keep serving in
+ *                             the background; quit via SIGTERM).
+ */
+const CFG = (() => {
+  const remoteUrl = process.env.CLD_REMOTE_URL || "";
+  const bindHost = process.env.CLD_BIND_HOST || "";
+  const port = process.env.CLD_PORT ? Number(process.env.CLD_PORT) : undefined;
+  const headless = process.env.CLD_HEADLESS === "1";
+  const trustedHosts = (process.env.CLD_TRUSTED_HOSTS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return { remoteUrl, bindHost, port, headless, trustedHosts };
+})();
+
+/** ------------------------------------------------------- mode picker */
+
+const MODE_CFG_FILE = path.join(os.homedir(), ".cld", "config.json");
+const DEFAULT_REMOTE_URL = "http://100.120.203.20:3081";
+
+function readModeCfg() {
+  try {
+    return JSON.parse(readFileSync(MODE_CFG_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeModeCfg(cfg) {
+  try {
+    mkdirSync(path.dirname(MODE_CFG_FILE), { recursive: true });
+    writeFileSync(MODE_CFG_FILE, JSON.stringify(cfg, null, 2));
+  } catch {
+    /* non-fatal */
+  }
+}
+
+/** Relaunch this app with a clean env (no CLD_* mode vars) so the mode
+ *  picker's saved config takes effect. */
+function relaunchClean() {
+  const env = { ...process.env };
+  for (const k of ["CLD_REMOTE_URL", "CLD_BIND_HOST", "CLD_PORT", "CLD_HEADLESS", "CLD_TRUSTED_HOSTS"]) delete env[k];
+  const args = process.argv.slice(1);
+  try {
+    const p = spawn(process.execPath, args, { env, detached: true, stdio: "ignore" });
+    p.unref();
+  } catch {
+    /* best effort */
+  }
+  app.quit();
+}
+
+/**
+ * Ask which mode to run in. Resolves true when the app should continue in
+ * the chosen mode (config file already written), false on cancel.
+ * @param showRemember - show the "remember my choice" checkbox (startup).
+ */
+async function askMode(showRemember = true) {
+  const { response, checkboxChecked } = await dialog.showMessageBox({
+    type: "question",
+    title: `${APP_NAME} — 连接模式`,
+    message: "这次想以哪种方式运行？",
+    detail: `连接家里服务器：使用 ${DEFAULT_REMOTE_URL} 上的全部会话与配置（需要网络/Tailscale 可达）。\n\n本机模式：在本机独立运行，数据只保存在本机。`,
+    buttons: ["连接家里服务器", "本机模式", "取消"],
+    defaultId: 0,
+    cancelId: 2,
+    checkboxLabel: "记住我的选择，下次不再询问",
+    checkboxChecked: false,
+  });
+  if (response === 2) return false;
+  const mode = response === 0 ? "remote" : "local";
+  writeModeCfg({ mode, remoteUrl: DEFAULT_REMOTE_URL, remember: showRemember ? checkboxChecked : true });
+  return true;
+}
+
+/** Startup mode resolution: env wins; else saved config; else ask. */
+async function resolveStartupMode() {
+  if (process.env.CLD_REMOTE_URL || process.env.CLD_BIND_HOST) return; // env decided
+  const cfg = readModeCfg();
+  if (cfg.mode === "remote" && cfg.remember === true) {
+    CFG.remoteUrl = cfg.remoteUrl || DEFAULT_REMOTE_URL;
+    return;
+  }
+  if (cfg.mode === "local" && cfg.remember === true) return; // local default
+  const ok = await askMode(true);
+  if (!ok) {
+    app.quit();
+    return;
+  }
+  const chosen = readModeCfg();
+  if (chosen.mode === "remote") CFG.remoteUrl = chosen.remoteUrl || DEFAULT_REMOTE_URL;
+}
+
+const SERVER_DEFAULT_PORT = 3081;
+
+let child = null;
+let quitting = false;
+let logStream = null;
+let lastErrorTail = "";
+let lastResolvedUrl = null;
+
+/** Collect every host the dsh /api trust fence should trust in server mode:
+ *  Tailscale device IPs (any device that might connect) + the LAN IP of
+ *  THIS machine. Returns host strings (no port). */
+function collectTrustedHosts() {
+  const out = [];
+  const tsCmd = existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale") ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale" : "tailscale";
+  try {
+    const text = execFileSync(tsCmd, ["status"], { encoding: "utf8", timeout: 4000 });
+    for (const line of text.split("\n")) {
+      const m = line.match(/^(\d+\.\d+\.\d+\.\d+)\s+\S+/);
+      if (m) out.push(m[1]);
+    }
+  } catch {
+    /* tailscale not available — fall back to LAN IP only */
+  }
+  try {
+    const lan = execFileSync("ipconfig", ["getifaddr", "en0"], { encoding: "utf8", timeout: 4000 }).trim();
+    if (lan && !out.includes(lan)) out.push(lan);
+  } catch {
+    /* no en0 */
+  }
+  return [...new Set(out)];
+}
+
+function spawnDsh(runtime) {
+  const bin = dshBinPath(runtime);
+  if (!existsSync(bin)) {
+    const msg = `dsh runtime not found at:\n${bin}\n\nRun \`npm run postinstall\` (or npm install) in the CLD project to build the bundled runtime.`;
+    dialog.showErrorBox(`${APP_NAME} — runtime missing`, msg);
+    throw new Error(msg);
+  }
+
+  logStream = openLogStream();
+  logStream.write(`\n===== CLD boot ${new Date().toISOString()} =====\n`);
+
+  // Spawn this very binary as plain Node (ELECTRON_RUN_AS_NODE), running the
+  // bundled dsh CLI. `--port 0` asks the OS for a free port; the real URL is
+  // announced on stdout as `dsh web: http://127.0.0.1:<port>`.
+  //
+  // `--expose-internals` is required: dsh's loader probes the Node internal
+  // module loader (to resolve profile-installed plugins against the profile
+  // directory) via node-addon-require-builtin, a native addon whose symbol
+  // probing fails under Electron's V8. The flag path works and sidesteps it.
+  const dshArgs = ["--expose-internals", bin, "web", "--port", "0"];
+  if (CFG.bindHost) {
+    // Server mode: dsh web stays on LOOPBACK (safest); the public port is
+    // served by inject-proxy, which adds the mobile stylesheet. The proxy
+    // passes the client's original Host through so the dsh /api trust fence
+    // can match it against --trusted-host entries (filesystem routes like
+    // host.pickDirectory need an explicit trusted host — loopback is not
+    // enough). We auto-add every Tailscale device IP + the user's LAN IP.
+    const autoTrusted = collectTrustedHosts();
+    for (const h of autoTrusted) dshArgs.push("--trusted-host", h);
+    for (const h of CFG.trustedHosts) dshArgs.push("--trusted-host", h);
+    logStream.write(`[cld] server mode: public ${CFG.bindHost}:${CFG.port ?? SERVER_DEFAULT_PORT} via inject-proxy (mobile css, trusted: ${autoTrusted.join(", ")})\n`);
+  }
+  child = spawn(
+    process.execPath,
+    dshArgs,
+    {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      // Sessions are keyed by the workspace cwd (all existing sessions were
+      // created under $HOME). Run dsh web from the user's home so the GUI's
+      // workspace filter matches them — otherwise (e.g. launchd cwd="/") the
+      // session list shows up empty.
+      cwd: os.homedir(),
+    },
+  );
+
+  const tail = [];
+  const pushTail = (line) => {
+    tail.push(line);
+    if (tail.length > 40) tail.shift();
+  };
+
+  child.stdout.on("data", (buf) => {
+    const text = buf.toString();
+    logStream?.write(text);
+    for (const line of text.split(/\r?\n/)) {
+      if (line.trim()) pushTail(line);
+      const m = line.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+)/);
+      if (m) {
+        lastResolvedUrl = m[1];
+        resolveUrl(m[1]);
+      }
+    }
+  });
+
+  child.stderr.on("data", (buf) => {
+    const text = buf.toString();
+    logStream?.write(text);
+    for (const line of text.split(/\r?\n/)) if (line.trim()) pushTail(line);
+  });
+
+  child.on("exit", (code, signal) => {
+    if (quitting) return;
+    const tailText = tail.slice(-20).join("\n") || "(no output)";
+    lastErrorTail = tailText;
+    dialog.showErrorBox(
+      `${APP_NAME} — dsh server stopped unexpectedly`,
+      `The dsh server exited (code ${code ?? "null"}, signal ${signal ?? "null"}).\n\nLast log lines:\n${tailText}\n\nFull log: ~/.cld/logs/dsh-web.log`,
+    );
+    app.quit();
+  });
+
+  child.on("error", (err) => {
+    if (quitting) return;
+    dialog.showErrorBox(`${APP_NAME} — failed to start dsh`, String(err?.message ?? err));
+    app.quit();
+  });
+
+  return child;
+}
+
+/** --------------------------------------------------------- server health */
+
+let resolveUrl = null;
+
+function awaitServerUrl(timeoutMs = BOOT_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Timed out waiting for dsh web to announce its URL (${timeoutMs}ms).\n\n${lastErrorTail || "(no output yet)"}`));
+    }, timeoutMs);
+    resolveUrl = (url) => {
+      clearTimeout(timer);
+      resolve(url);
+    };
+  });
+}
+
+async function waitForHttpReady(url, timeoutMs = 60_000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) return true;
+    } catch {
+      /* server not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+/** ---------------------------------------------------------------- window */
+
+let mainWindow = null;
+
+function createWindow(url) {
+  mainWindow = new BrowserWindow({
+    width: 1280,
+    height: 840,
+    minWidth: 900,
+    minHeight: 600,
+    title: APP_NAME,
+    backgroundColor: "#0f1115",
+    icon: iconPath(),
+    show: false,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  mainWindow.once("ready-to-show", () => mainWindow?.show());
+  mainWindow.loadURL(url);
+
+  // Keep the surface on the trusted hosts (loopback, plus the remote server
+  // host in connect-only mode); open anything else in the system browser.
+  const allowHost = CFG.remoteUrl ? new URL(CFG.remoteUrl).hostname : null;
+  const isTrustedTarget = (target) => {
+    try {
+      const u = new URL(target);
+      return /^(127\.0\.0\.1|localhost)$/.test(u.hostname) || (allowHost !== null && u.hostname === allowHost);
+    } catch {
+      return false;
+    }
+  };
+  mainWindow.webContents.setWindowOpenHandler(({ url: target }) => {
+    if (isTrustedTarget(target)) return { action: "allow" };
+    shell.openExternal(target);
+    return { action: "deny" };
+  });
+  mainWindow.webContents.on("will-navigate", (event, target) => {
+    if (!isTrustedTarget(target)) event.preventDefault();
+  });
+
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
+}
+
+function buildMenu() {
+  const template = [
+    ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
+    {
+      label: "File",
+      submenu: [process.platform === "darwin" ? { role: "close" } : { role: "quit" }],
+    },
+    { role: "editMenu" },
+    {
+      label: "View",
+      submenu: [
+        { role: "reload" },
+        { role: "forceReload" },
+        { role: "toggleDevTools" },
+        { type: "separator" },
+        { role: "resetZoom" },
+        { role: "zoomIn" },
+        { role: "zoomOut" },
+        { type: "separator" },
+        { role: "togglefullscreen" },
+      ],
+    },
+    {
+      label: "工具",
+      submenu: [
+        {
+          label: "切换连接模式…",
+          click: async () => {
+            const ok = await askMode(false);
+            if (ok) relaunchClean();
+          },
+        },
+        {
+          label: "设备中心（设备状态机）",
+          click: async () => {
+            const statusScript = path.join(__dirname, "scripts", "device-status.mjs");
+            const statusChild = spawn(process.execPath, [statusScript, "--write"], {
+              env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let statusOut = "";
+            statusChild.stdout.on("data", (b) => (statusOut += b.toString()));
+            statusChild.stderr.on("data", (b) => (statusOut += b.toString()));
+            statusChild.on("close", () => {
+              dialog.showMessageBox(mainWindow ?? undefined, {
+                type: "info",
+                title: "设备状态机",
+                message: statusOut || "(无输出 — 检查 scripts/device-status.mjs 是否存在)",
+                buttons: ["好的"],
+              });
+            });
+          },
+        },
+        {
+          label: "检查并修复会话",
+          click: async () => {
+            const { parsed } = await runDoctor({ fix: true, notify: false });
+            const fixedCount = parsed?.fixed ?? 0;
+            const lines = parsed?.sessions ?? [];
+            dialog.showMessageBox(mainWindow ?? undefined, {
+              type: "info",
+              title: "会话健康检查",
+              message: fixedCount > 0 ? `已修复 ${fixedCount} 个损坏会话` : "所有会话健康",
+              detail: lines.map((l) => l).join("\n") || "(无输出)",
+              buttons: ["好的"],
+            });
+          },
+        },
+      ],
+    },
+    { role: "windowMenu" },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+/** ----------------------------------------------------------------- doctor */
+
+function doctorScriptPath() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "app.asar", "scripts", "session-doctor.mjs")
+    : path.join(__dirname, "scripts", "session-doctor.mjs");
+}
+
+/**
+ * Run the session doctor (scan + optional auto-repair) as a Node child using
+ * this very binary (ELECTRON_RUN_AS_NODE). Resolves with the parsed --json
+ * report; never rejects.
+ */
+function runDoctor({ fix = true, notify = true } = {}) {
+  return new Promise((resolve) => {
+    const script = doctorScriptPath();
+    const doctorArgs = [script, "--json", ...(fix ? ["--fix"] : [])];
+    const doctor = spawn(process.execPath, doctorArgs, {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    doctor.stdout.on("data", (b) => (out += b.toString()));
+    doctor.stderr.on("data", (b) => (out += b.toString()));
+    doctor.on("close", (code) => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(out.trim().split("\n").pop());
+      } catch {
+        /* non-JSON output (script failure) — keep parsed null */
+      }
+      const fixedCount = parsed?.fixed ?? 0;
+      logStream?.write(`\n[doctor] exit=${code} ${out.trim().slice(0, 2000)}\n`);
+      if (notify && fixedCount > 0 && Notification.isSupported()) {
+        new Notification({
+          title: `${APP_NAME} — 会话自动修复`,
+          body: `已自动修复 ${fixedCount} 个损坏会话。`,
+        }).show();
+      }
+      resolve({ code, parsed, out });
+    });
+    doctor.on("error", (err) => {
+      logStream?.write(`\n[doctor] spawn error: ${String(err?.message ?? err)}\n`);
+      resolve({ code: -1, parsed: null, out: String(err?.message ?? err) });
+    });
+  });
+}
+
+/** ------------------------------------------------------------------- boot */
+
+async function start() {
+  buildMenu();
+
+  // Mode picker: env decides (CLI launches) or saved config, else ask.
+  await resolveStartupMode();
+
+  // Connect-only mode: no local server, no local doctor — just load the
+  // remote dsh web URL (sessions/state live on that machine).
+  if (CFG.remoteUrl) {
+    logStream = openLogStream();
+    logStream.write(`\n===== CLD boot ${new Date().toISOString()} (remote: ${CFG.remoteUrl}) =====\n`);
+    const ready = await waitForHttpReady(CFG.remoteUrl);
+    if (!ready) {
+      // Offer to fall back to local mode when the server is unreachable
+      // (e.g. away from home / Tailscale down).
+      const { response } = await dialog.showMessageBox({
+        type: "warning",
+        title: `${APP_NAME} — 连不上服务器`,
+        message: `无法连接到 ${CFG.remoteUrl}`,
+        detail: "请确认家里服务器在运行、网络/Tailscale 可达。也可以切换到本机模式独立运行。",
+        buttons: ["重试", "切到本机模式", "退出"],
+        defaultId: 0,
+        cancelId: 2,
+      });
+      if (response === 0) return start();
+      if (response === 1) {
+        writeModeCfg({ mode: "local", remember: true });
+        relaunchClean();
+        return;
+      }
+      app.quit();
+      return;
+    }
+    if (!CFG.headless) createWindow(CFG.remoteUrl);
+    return;
+  }
+
+  const runtime = runtimeDir();
+  const bin = dshBinPath(runtime);
+  if (!existsSync(bin)) {
+    dialog.showErrorBox(
+      `${APP_NAME} — runtime missing`,
+      `dsh runtime not found at:\n${bin}\n\nIn the CLD project run:\n  npm run postinstall`,
+    );
+    app.quit();
+    return;
+  }
+
+  const urlPromise = awaitServerUrl();
+  spawnDsh(runtime);
+
+  // Background session self-check: scan + auto-repair quiesced corrupt
+  // sessions while dsh web boots. Never blocks window creation.
+  runDoctor({ fix: true }).catch(() => {});
+
+  let url;
+  try {
+    url = await urlPromise;
+  } catch (err) {
+    dialog.showErrorBox(`${APP_NAME} — dsh failed to boot`, String(err?.message ?? err));
+    app.quit();
+    return;
+  }
+
+  const ready = await waitForHttpReady(url);
+  if (!ready) {
+    dialog.showErrorBox(`${APP_NAME} — dsh server not responding`, `The server at ${url} did not answer within 60s.\n\n${lastErrorTail || "(no output yet)"}`);
+    app.quit();
+    return;
+  }
+
+  // Server mode: expose the public port through the inject-proxy once the
+  // loopback dsh web is up (mobile stylesheet + Host rewrite for the fence).
+  if (CFG.bindHost && !CFG.proxySpawned) {
+    CFG.proxySpawned = true;
+    const servePort = CFG.port ?? SERVER_DEFAULT_PORT;
+    spawnInjectProxy(CFG.bindHost, servePort, new URL(url).port);
+  }
+
+  if (!CFG.headless) createWindow(url);
+}
+
+/** Spawn scripts/inject-proxy.mjs (ELECTRON_RUN_AS_NODE) on the public port. */
+function spawnInjectProxy(bindHost, listenPort, targetPort) {
+  const proxy = path.join(__dirname, "scripts", "inject-proxy.mjs");
+  const css = path.join(__dirname, "scripts", "mobile.css");
+  if (!existsSync(proxy)) {
+    logStream?.write(`[cld] inject-proxy missing at ${proxy}\n`);
+    return;
+  }
+  const p = spawn(process.execPath, [proxy, bindHost, String(listenPort), String(targetPort), css], {
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  p.stdout.on("data", (b) => logStream?.write(b.toString()));
+  p.stderr.on("data", (b) => logStream?.write(b.toString()));
+  p.on("exit", (code, signal) => {
+    if (!quitting) logStream?.write(`[cld] inject-proxy exited (code ${code}, signal ${signal})\n`);
+  });
+  return p;
+}
+
+/** --------------------------------------------------------------- lifecycle */
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+
+  app.whenReady().then(start);
+
+  app.on("activate", () => {
+    // macOS dock click after all windows closed: respawn the window using the
+    // last URL announced by the still-running dsh child.
+    if (mainWindow === null && child && lastResolvedUrl) createWindow(lastResolvedUrl);
+  });
+
+  app.on("before-quit", () => {
+    quitting = true;
+    if (child && !child.killed) {
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (child && !child.killed) child.kill("SIGKILL");
+      }, KILL_GRACE_MS).unref();
+    }
+  });
+
+  app.on("window-all-closed", () => {
+    app.quit();
+  });
+
+  process.on("exit", () => {
+    try {
+      child?.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    logStream?.end();
+  });
+}
